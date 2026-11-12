@@ -18,7 +18,7 @@ from pathlib import Path
 import psutil
 import re
 
-from . import config, db, policy
+from . import config, db, policy, uploads
 
 log = logging.getLogger("webpanel.chats")
 MB = 1024 * 1024
@@ -529,6 +529,9 @@ class ChatManager:
         argv += ["--resume", sid] if resume else ["--session-id", sid]
         if chat["model"]:
             argv += ["--model", chat["model"]]
+        up = uploads.uploads_dir(cd)
+        up.mkdir(exist_ok=True)
+        argv += ["--add-dir", str(up)]
         if user["is_admin"]:
             sp = (f"Ты общаешься с пользователем «{user['username']}» (администратор) через веб-чат webpanel. "
                   "Интерактивный AskUserQuestion недоступен — задавай вопросы текстом. Опасные действия с ОС и "
@@ -744,8 +747,9 @@ class ChatManager:
         hub.to_admins({"t": "sessions_changed"})
 
     # ---------- сообщения
-    async def send(self, chat, user, text: str):
+    async def send(self, chat, user, text: str, files: list[dict] | None = None):
         cid = str(chat["id"])
+        files = files or []
         if cid not in self.rt:
             await self.start(chat, user)
         rt = self.rt.get(cid)
@@ -754,15 +758,24 @@ class ChatManager:
         if rt.busy:
             raise StartError("busy", "Claude ещё отвечает. Дождитесь окончания или остановите ответ.")
         if not chat["has_transcript"] or chat["title"] == "Новый диалог":
-            first = next((l.strip() for l in text.splitlines() if l.strip()), "Новый диалог")
+            first = next((l.strip() for l in text.splitlines() if l.strip()), None)
+            first = first or (("📎 " + files[0]["name"]) if files else "Новый диалог")
             title = first[:80] + ("…" if len(first) > 80 else "")
             await db.execute("UPDATE chats SET title = CASE WHEN has_transcript THEN title ELSE $2 END, "
                              "has_transcript = true WHERE id = $1", chat["id"], title)
         await db.execute("UPDATE chats SET last_activity = now() WHERE id = $1", chat["id"])
         rt.busy = True
         rt.last_activity = time.time()
-        rt.writer.write((json.dumps({"op": "send", "text": text}, ensure_ascii=False) + "\n").encode())
+        cmd = {"op": "send", "text": text}
+        if files:
+            full, blocks = await asyncio.to_thread(uploads.build_message, chat_dir(cid), text, files)
+            # старый раннер понимает только text: получит текст со списком путей к файлам
+            cmd = {"op": "send", "text": full, "display": text,
+                   "files": [uploads.public(m) for m in files], "content": blocks}
+        rt.writer.write((json.dumps(cmd, ensure_ascii=False) + "\n").encode())
         await rt.writer.drain()
+        if files:
+            await asyncio.to_thread(uploads.mark_sent, chat_dir(cid), files)
         await self.push_chat(cid)
 
     async def interrupt(self, chat_id):
@@ -788,7 +801,8 @@ class ChatManager:
         user = await db.fetchrow("SELECT * FROM users WHERE id = $1", rt.user_id)
         if not chat or not user:
             return {"decision": "deny", "reason": "webpanel: чат не найден"}
-        decision, reason = policy.decide(user, chat_cwd(chat), tool or "", inp or {})
+        decision, reason = policy.decide(user, chat_cwd(chat), tool or "", inp or {},
+                                         uploads.uploads_dir(chat_dir(chat_id)))
         rt.last_activity = time.time()
         if decision != "ask":
             return {"decision": decision, "reason": reason}

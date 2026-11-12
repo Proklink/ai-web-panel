@@ -1,12 +1,12 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, Approval, Chat, Ev, fmtMb, fmtTime } from "./api";
+import { api, Approval, Chat, Ev, fmtSize, fmtTime, UploadedFile, uploadFile, uploadUrl } from "./api";
 import { socket } from "./ws";
 import type { RunWithStart } from "./App";
 
 type Item =
-  | { kind: "user"; key: string; text: string; ts: number }
+  | { kind: "user"; key: string; text: string; ts: number; files?: UploadedFile[] }
   | { kind: "text"; key: string; text: string }
   | { kind: "thinking"; key: string; text: string }
   | { kind: "tool"; key: string; id: string; name: string; input: any; result?: { content: any; is_error: boolean } }
@@ -20,7 +20,7 @@ function buildItems(events: Ev[]): Item[] {
   const approvals = new Map<string, Item & { kind: "approval" }>();
   for (const ev of events) {
     const d = ev.d || {};
-    if (ev.k === "user") items.push({ kind: "user", key: "u" + ev.seq, text: d.text, ts: ev.ts });
+    if (ev.k === "user") items.push({ kind: "user", key: "u" + ev.seq, text: d.text, ts: ev.ts, files: d.files });
     else if (ev.k === "sys") {
       if (d.event === "notice") items.push({ kind: "notice", key: "n" + ev.seq, level: d.level || "info", text: d.text, ts: ev.ts });
       else if (d.event === "exited" && d.code !== 0 && d.code !== null)
@@ -67,6 +67,42 @@ function buildItems(events: Ev[]): Item[] {
 }
 
 const finePointer = typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
+const MAX_FILES = 10;
+const MAX_MB = 25;
+const TALL_KEY = "wp-composer-tall";
+
+type Att = {
+  key: string;
+  name: string;
+  size: number;
+  preview?: string;
+  progress: number;
+  status: "uploading" | "done" | "error";
+  error?: string;
+  file?: UploadedFile;
+  abort?: () => void;
+};
+
+/** Большие фото (и HEIC) пережимаем в JPEG ≤2560 px: быстрее загрузка, Claude принимает картинки до 5 МБ. */
+async function prepareImage(f: File): Promise<{ blob: Blob; name: string }> {
+  const heic = /image\/hei[cf]/.test(f.type) || /\.hei[cf]$/i.test(f.name);
+  if (!f.type.startsWith("image/") || f.type === "image/gif" || f.type === "image/svg+xml") return { blob: f, name: f.name };
+  if (!heic && f.size <= 3.5 * 1024 * 1024) return { blob: f, name: f.name };
+  try {
+    const bmp = await createImageBitmap(f);
+    const k = Math.min(1, 2560 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(bmp.width * k);
+    c.height = Math.round(bmp.height * k);
+    c.getContext("2d")!.drawImage(bmp, 0, 0, c.width, c.height);
+    bmp.close?.();
+    const blob = await new Promise<Blob | null>((r) => c.toBlob(r, "image/jpeg", 0.88));
+    if (!blob) throw new Error("toBlob");
+    return { blob, name: f.name.replace(/\.[^.]+$/, "") + ".jpg" };
+  } catch {
+    return { blob: f, name: f.name };
+  }
+}
 
 export default function ChatView({ chat, runWithStart, onToast }: { chat: Chat; runWithStart: RunWithStart; onToast: (s: string) => void }) {
   const [events, setEvents] = useState<Ev[]>([]);
@@ -78,6 +114,63 @@ export default function ChatView({ chat, runWithStart, onToast }: { chat: Chat; 
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [atts, setAtts] = useState<Att[]>([]);
+  const [drag, setDrag] = useState(false);
+  const [tall, setTall] = useState(() => localStorage.getItem(TALL_KEY) === "1");
+
+  function toggleTall() {
+    const v = !tall;
+    setTall(v);
+    localStorage.setItem(TALL_KEY, v ? "1" : "0");
+    if (taRef.current) taRef.current.style.height = ""; // сбросить ручную высоту
+    taRef.current?.focus();
+  }
+
+  function patchAtt(key: string, p: Partial<Att>) {
+    setAtts((as) => as.map((a) => (a.key === key ? { ...a, ...p } : a)));
+  }
+
+  async function addFiles(list: FileList | File[]) {
+    const files = Array.from(list);
+    if (!files.length) return;
+    const room = MAX_FILES - atts.length;
+    if (files.length > room) onToast(`Не больше ${MAX_FILES} файлов в одном сообщении`);
+    for (const f of files.slice(0, Math.max(0, room))) {
+      const key = Math.random().toString(36).slice(2);
+      const isImg = f.type.startsWith("image/") && f.type !== "image/svg+xml";
+      setAtts((as) => [...as, { key, name: f.name, size: f.size, progress: 0, status: "uploading",
+        preview: isImg ? URL.createObjectURL(f) : undefined }]);
+      const { blob, name } = await prepareImage(f);
+      if (blob.size > MAX_MB * 1024 * 1024) {
+        patchAtt(key, { status: "error", error: `больше ${MAX_MB} МБ` });
+        continue;
+      }
+      const up = uploadFile(chat.id, blob, name, (p) => patchAtt(key, { progress: p }));
+      patchAtt(key, { abort: up.abort, size: blob.size, name });
+      up.promise
+        .then((file) => patchAtt(key, { status: "done", progress: 1, file }))
+        .catch((e) => patchAtt(key, { status: "error", error: e.message }));
+    }
+  }
+
+  function removeAtt(a: Att) {
+    if (a.status === "uploading") a.abort?.();
+    if (a.file) api(`/chats/${chat.id}/uploads/${a.file.id}`, { method: "DELETE" }).catch(() => {});
+    if (a.preview) URL.revokeObjectURL(a.preview);
+    setAtts((as) => as.filter((x) => x.key !== a.key));
+  }
+
+  const attsRef = useRef(atts);
+  attsRef.current = atts;
+  useEffect(() => () => {
+    // смена диалога: незагруженные вложения отменяем, превью освобождаем
+    attsRef.current.forEach((a) => {
+      if (a.status === "uploading") a.abort?.();
+      if (a.preview) URL.revokeObjectURL(a.preview);
+    });
+    setAtts([]);
+  }, [chat.id]);
 
   useEffect(() => {
     seqRef.current = 0;
@@ -127,13 +220,22 @@ export default function ChatView({ chat, runWithStart, onToast }: { chat: Chat; 
     if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
   }
 
+  const uploading = atts.some((a) => a.status === "uploading");
+  const ready = atts.filter((a) => a.status === "done" && a.file);
+  const canSend = (!!draft.trim() || ready.length > 0) && !uploading && !sending;
+
   async function send() {
     const text = draft.trim();
-    if (!text || sending) return;
+    if (!canSend) return;
     setSending(true);
     stick.current = true;
-    const ok = await runWithStart(() => api(`/chats/${chat.id}/messages`, { method: "POST", body: { text } }));
-    if (ok) setDraft("");
+    const files = ready.map((a) => a.file!.id);
+    const ok = await runWithStart(() => api(`/chats/${chat.id}/messages`, { method: "POST", body: { text, files } }));
+    if (ok) {
+      setDraft("");
+      atts.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
+      setAtts([]);
+    }
     setSending(false);
     taRef.current?.focus();
   }
@@ -151,32 +253,25 @@ export default function ChatView({ chat, runWithStart, onToast }: { chat: Chat; 
   const pending = new Map(chat.approvals.map((a) => [a.id, a]));
 
   return (
-    <div className="chat">
-      <div className="chat-head">
-        <div className="chat-head-title">
-          <strong title={chat.title}>{chat.title}</strong>
-          <span className="muted small">
-            {chat.project ? `проект ${chat.project}` : "без проекта"}
-            {chat.model ? ` · ${chat.model}` : ""}
-            {" · "}
-            {suspended ? "выгружен на диск" : chat.busy ? "отвечает…" : "в RAM"}
-            {!suspended && chat.rss_mb > 0 && ` · ${fmtMb(chat.rss_mb)}`}
-          </span>
-        </div>
-        <div className="row gap">
-          {suspended ? (
-            <button onClick={() => runWithStart(() => api(`/chats/${chat.id}/resume`, { method: "POST" }))}>Вернуть в RAM</button>
-          ) : (
-            <button onClick={() => act("/suspend")} disabled={chat.busy} title="Остановить процесс, сжать и сохранить контекст на диск">
-              Выгрузить
-            </button>
-          )}
-          <button className="danger" onClick={() => act("", "DELETE", "Удалить диалог безвозвратно? Будут стёрты история, контекст Claude и файлы личной папки диалога.")}>
-            Удалить
-          </button>
-        </div>
-      </div>
-
+    <div
+      className={"chat" + (drag ? " dragging" : "")}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) {
+          e.preventDefault();
+          setDrag(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) setDrag(false);
+      }}
+      onDrop={(e) => {
+        if (!e.dataTransfer.files.length) return;
+        e.preventDefault();
+        setDrag(false);
+        addFiles(e.dataTransfer.files);
+      }}
+    >
+      {drag && <div className="drop-hint">Отпустите, чтобы прикрепить файлы</div>}
       <div className="messages" ref={scroller} onScroll={onScroll}>
         {!loaded && <div className="muted center pad">Загрузка истории…</div>}
         {loaded && items.length === 0 && (
@@ -196,18 +291,42 @@ export default function ChatView({ chat, runWithStart, onToast }: { chat: Chat; 
 
       {suspended && (
         <div className="banner">
-          <strong>Сессия выгружена из RAM</strong> — история и контекст сохранены на диске в сжатом виде. Отправьте сообщение или нажмите «Вернуть в RAM»: сервер проверит, хватает ли памяти.
+          <strong>Сессия выгружена из RAM</strong> — история и контекст сохранены на диске в сжатом виде. Отправьте сообщение или нажмите ▶ у диалога в списке: сервер проверит, хватает ли памяти.
           {chat.notice && <div className="small muted">{chat.notice}</div>}
         </div>
       )}
 
-      <div className="composer">
+      <div className={"composer" + (tall ? " tall" : "")}>
+        {atts.length > 0 && (
+          <div className="att-strip">
+            {atts.map((a) => (
+              <div key={a.key} className={"att " + a.status} title={a.error ? `${a.name}: ${a.error}` : a.name}>
+                {a.preview ? <img src={a.preview} alt="" /> : <span className="att-icon">{fileIcon(a.name)}</span>}
+                <div className="att-info">
+                  <div className="att-name">{a.name}</div>
+                  <div className="att-meta">
+                    {a.status === "uploading" ? `${Math.round(a.progress * 100)}%` : a.status === "error" ? a.error : fmtSize(a.size)}
+                  </div>
+                </div>
+                {a.status === "uploading" && <div className="att-bar" style={{ width: `${a.progress * 100}%` }} />}
+                <button className="att-x" onClick={() => removeAtt(a)} aria-label="Убрать">×</button>
+              </div>
+            ))}
+          </div>
+        )}
         <textarea
           ref={taRef}
-          rows={Math.min(8, Math.max(1, draft.split("\n").length))}
-          placeholder={chat.busy ? "Claude отвечает…" : finePointer ? "Сообщение (Enter — отправить, Shift+Enter — новая строка)" : "Сообщение"}
+          rows={tall ? undefined : Math.min(12, Math.max(3, draft.split("\n").length))}
+          placeholder={chat.busy ? "Claude отвечает…" : finePointer ? "Сообщение (Enter — отправить, Shift+Enter — новая строка). Файлы можно перетащить или вставить" : "Сообщение"}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          onPaste={(e) => {
+            const fs = Array.from(e.clipboardData.files);
+            if (fs.length) {
+              e.preventDefault();
+              addFiles(fs);
+            }
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && finePointer) {
               e.preventDefault();
@@ -215,13 +334,23 @@ export default function ChatView({ chat, runWithStart, onToast }: { chat: Chat; 
             }
           }}
         />
-        {chat.busy ? (
-          <button className="danger" onClick={() => act("/interrupt")}>Стоп</button>
-        ) : (
-          <button className="primary" disabled={!draft.trim() || sending} onClick={send}>
-            {sending ? "…" : "Отправить"}
-          </button>
-        )}
+        <div className="composer-bar">
+          <button className="icon-btn attach" title="Прикрепить фото или документ" aria-label="Прикрепить файл"
+            onClick={() => fileRef.current?.click()} disabled={atts.length >= MAX_FILES}>📎</button>
+          <input ref={fileRef} type="file" multiple hidden onChange={(e) => {
+            if (e.target.files) addFiles(e.target.files);
+            e.target.value = "";
+          }} />
+          <button className="icon-btn" onClick={toggleTall} title={tall ? "Уменьшить поле" : "Развернуть поле"}
+            aria-label={tall ? "Уменьшить поле" : "Развернуть поле"}>{tall ? "⤡" : "⤢"}</button>
+          <span className="spacer" />
+          {chat.busy ? (
+            <button className="round-btn stop" onClick={() => act("/interrupt")} title="Остановить ответ" aria-label="Остановить ответ">■</button>
+          ) : (
+            <button className="round-btn send" disabled={!canSend} onClick={send} aria-label="Отправить"
+              title={uploading ? "Дождитесь загрузки файлов" : "Отправить"}>{sending ? "…" : "↑"}</button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -234,7 +363,8 @@ const ItemView = memo(function ItemView({ it, pending, chatId, onToast }: {
     case "user":
       return (
         <div className="msg user">
-          <div className="user-text">{it.text}</div>
+          {it.files && it.files.length > 0 && <Attachments chatId={chatId} files={it.files} />}
+          {it.text && <div className="user-text">{it.text}</div>}
           <div className="meta">{fmtTime(it.ts)}</div>
         </div>
       );
@@ -360,3 +490,35 @@ const Markdown = memo(function Markdown({ text }: { text: string }) {
     </div>
   );
 });
+
+function fileIcon(name: string) {
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+  if (ext === "pdf") return "📕";
+  if (["doc", "docx", "odt", "rtf"].includes(ext)) return "📝";
+  if (["xls", "xlsx", "ods", "csv", "tsv"].includes(ext)) return "📊";
+  if (["zip", "gz", "tgz", "7z", "rar", "tar"].includes(ext)) return "🗜";
+  if (["png", "jpg", "jpeg", "gif", "webp", "heic"].includes(ext)) return "🖼";
+  return "📄";
+}
+
+function Attachments({ chatId, files }: { chatId: string; files: UploadedFile[] }) {
+  return (
+    <div className="msg-files">
+      {files.map((f) =>
+        f.image ? (
+          <a key={f.id} href={uploadUrl(chatId, f.id)} target="_blank" rel="noopener" className="msg-img" title={f.name}>
+            <img src={uploadUrl(chatId, f.id)} alt={f.name} loading="lazy" />
+          </a>
+        ) : (
+          <a key={f.id} href={uploadUrl(chatId, f.id)} target="_blank" rel="noopener" className="msg-file" title={f.name}>
+            <span className="att-icon">{fileIcon(f.name)}</span>
+            <span className="att-info">
+              <span className="att-name">{f.name}</span>
+              <span className="att-meta">{fmtSize(f.size)}</span>
+            </span>
+          </a>
+        ),
+      )}
+    </div>
+  );
+}

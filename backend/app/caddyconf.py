@@ -74,7 +74,13 @@ def render(mode: str) -> str:
 	@internal path /internal/*
 	respond @internal 404
 
-	request_body {{
+	# вложения чата — до WEBPANEL_UPLOAD_MAX_MB, всё остальное — до 2 МБ
+	@upload path_regexp ^/api/chats/[^/]+/uploads$
+	request_body @upload {{
+		max_size {int(os.environ.get("WEBPANEL_UPLOAD_MAX_MB", "25")) + 1}MB
+	}}
+	@other not path_regexp ^/api/chats/[^/]+/uploads$
+	request_body @other {{
 		max_size 2MB
 	}}
 

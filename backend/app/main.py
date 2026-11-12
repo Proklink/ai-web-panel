@@ -16,8 +16,8 @@ from pydantic import BaseModel, Field
 import base64
 import time
 
-from . import auth, caddyconf, certs, config, db, resources
-from .chats import StartError, hub, Client, manager, read_events, incident_public
+from . import auth, caddyconf, certs, config, db, resources, uploads
+from .chats import StartError, hub, Client, manager, read_events, incident_public, chat_dir, dir_size
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("webpanel")
@@ -109,7 +109,8 @@ class NewChat(BaseModel):
 
 
 class Message(BaseModel):
-    text: str = Field(min_length=1, max_length=100_000)
+    text: str = Field(default="", max_length=100_000)
+    files: list[str] = Field(default=[], max_length=uploads.MAX_PER_MESSAGE)
 
 
 class ApprovalReq(BaseModel):
@@ -358,7 +359,80 @@ async def chat_events(chat_id: str, after: int = 0, user=Depends(auth.current_us
 @app.post("/api/chats/{chat_id}/messages")
 async def chat_send(chat_id: str, msg: Message, user=Depends(auth.current_user)):
     row = await own_chat(chat_id, user)
-    await manager.send(row, user, msg.text)
+    cd = chat_dir(row["id"])
+    metas = []
+    for fid in dict.fromkeys(msg.files):
+        m = uploads.load_meta(cd, fid)
+        if not m:
+            raise HTTPException(400, "Вложение не найдено — загрузите файл заново")
+        metas.append(m)
+    if not msg.text.strip() and not metas:
+        raise HTTPException(400, "Пустое сообщение")
+    await manager.send(row, user, msg.text, metas)
+    return {"ok": True}
+
+
+@app.post("/api/chats/{chat_id}/uploads")
+async def chat_upload(chat_id: str, request: Request, name: str = "file", user=Depends(auth.current_user)):
+    """Загрузка одного файла сырым телом запроса (имя — в ?name=)."""
+    row = await own_chat(chat_id, user)
+    cd = chat_dir(row["id"])
+    up = uploads.uploads_dir(cd)
+    up.mkdir(parents=True, exist_ok=True, mode=0o700)
+    limit = config.UPLOAD_MAX_MB * 1024 * 1024
+    declared = int(request.headers.get("content-length") or 0)
+    if declared > limit:
+        raise HTTPException(413, f"Файл больше {config.UPLOAD_MAX_MB} МБ")
+    used = await asyncio.to_thread(dir_size, up)
+    if used + declared > config.UPLOAD_CHAT_QUOTA_MB * 1024 * 1024:
+        raise HTTPException(413, f"Превышена квота вложений диалога ({config.UPLOAD_CHAT_QUOTA_MB} МБ)")
+    fid = uploads.new_id()
+    name = uploads.safe_name(name)
+    fname = f"{fid}-{name}"
+    tmp = up / f".{fid}.part"
+    size, head = 0, b""
+    try:
+        with tmp.open("wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(413, f"Файл больше {config.UPLOAD_MAX_MB} МБ")
+                if len(head) < 16:
+                    head += chunk[:16]
+                f.write(chunk)
+        if size == 0:
+            raise HTTPException(400, "Пустой файл")
+        tmp.replace(up / fname)
+    finally:
+        tmp.unlink(missing_ok=True)
+    meta = {"id": fid, "name": name, "file": fname, "size": size, "mime": uploads.sniff_mime(head, name),
+            "ts": time.time()}
+    uploads.write_meta(cd, meta)
+    return uploads.public(meta)
+
+
+@app.get("/api/chats/{chat_id}/uploads/{fid}")
+async def chat_upload_get(chat_id: str, fid: str, user=Depends(auth.current_user)):
+    row = await own_chat(chat_id, user)
+    cd = chat_dir(row["id"])
+    m = uploads.load_meta(cd, fid)
+    if not m:
+        raise HTTPException(404, "Файл не найден")
+    inline = m["mime"] in uploads.IMAGE_TYPES or m["mime"] == "application/pdf"
+    return FileResponse(uploads.file_path(cd, m), media_type=m["mime"] if inline else "application/octet-stream",
+                        filename=m["name"],
+                        content_disposition_type="inline" if inline else "attachment",
+                        headers={"Cache-Control": "private, max-age=86400", "Content-Security-Policy": "sandbox"})
+
+
+@app.delete("/api/chats/{chat_id}/uploads/{fid}")
+async def chat_upload_remove(chat_id: str, fid: str, user=Depends(auth.current_user)):
+    """Убрать ещё не отправленное вложение."""
+    row = await own_chat(chat_id, user)
+    cd = chat_dir(row["id"])
+    m = uploads.load_meta(cd, fid)
+    if m and not m.get("sent"):
+        await asyncio.to_thread(uploads.discard, cd, m)
     return {"ok": True}
 
 

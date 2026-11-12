@@ -30,6 +30,52 @@ export async function api<T = any>(path: string, opts: { method?: string; body?:
   return data as T;
 }
 
+export interface UploadedFile {
+  id: string;
+  name: string;
+  size: number;
+  mime: string;
+  image: boolean;
+}
+
+/** Загрузка файла сырым телом (XHR — ради прогресса). */
+export function uploadFile(chatId: string, file: Blob, name: string, onProgress?: (p: number) => void) {
+  const xhr = new XMLHttpRequest();
+  const promise = new Promise<UploadedFile>((resolve, reject) => {
+    xhr.open("POST", `/api/chats/${chatId}/uploads?name=${encodeURIComponent(name)}`);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("X-Requested-With", "webpanel");
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
+    xhr.onload = () => {
+      let data: any = null;
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch {
+        /* не JSON */
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else {
+        if (xhr.status === 401) window.dispatchEvent(new Event("wp-unauthorized"));
+        const msg = xhr.status === 413 && !data ? "Файл слишком большой" : data?.detail;
+        reject(new ApiError(xhr.status, msg || `Ошибка ${xhr.status}`));
+      }
+    };
+    xhr.onerror = () => reject(new ApiError(0, "Сеть недоступна"));
+    xhr.onabort = () => reject(new ApiError(0, "Отменено"));
+    xhr.send(file);
+  });
+  return { promise, abort: () => xhr.abort() };
+}
+
+export function uploadUrl(chatId: string, fileId: string) {
+  return `/api/chats/${chatId}/uploads/${fileId}`;
+}
+
+export function fmtSize(n: number) {
+  return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} МБ` : `${Math.max(1, Math.round(n / 1024))} КБ`;
+}
+
 export interface User {
   id: number;
   username: string;

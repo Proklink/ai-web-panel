@@ -98,18 +98,26 @@ def tools_for_rights(rights) -> list[str]:
     return tools
 
 
-def decide(user, chat_cwd: Path, tool: str, inp: dict) -> tuple[str, str]:
+def decide(user, chat_cwd: Path, tool: str, inp: dict, uploads: Path | None = None) -> tuple[str, str]:
+    """uploads — папка вложений этого чата: её можно читать (с правом read) и упоминать в командах."""
     inp = inp if isinstance(inp, dict) else {}
     if user["is_admin"]:
-        return _decide_admin(chat_cwd, tool, inp)
-    return _decide_user(set(user["rights"] or []), chat_cwd, tool, inp)
+        return _decide_admin(chat_cwd, tool, inp, uploads)
+    return _decide_user(set(user["rights"] or []), chat_cwd, tool, inp, uploads)
 
 
-def _decide_admin(cwd: Path, tool: str, inp: dict):
+def _strip_uploads(command: str, uploads: Path | None) -> str:
+    """Убирает из команды путь к вложениям своего чата, чтобы он не считался «данными webpanel»."""
+    if not uploads:
+        return command
+    return command.replace(str(uploads), "./uploads")
+
+
+def _decide_admin(cwd: Path, tool: str, inp: dict, uploads: Path | None = None):
     if tool == "AskUserQuestion":
         return "deny", "Интерактивные вопросы недоступны в веб-чате: задай вопрос обычным текстом"
     if tool in BASH_TOOLS:
-        why = destructive_reason(str(inp.get("command", "")))
+        why = destructive_reason(_strip_uploads(str(inp.get("command", "")), uploads))
         return ("ask", f"Опасная команда: {why}") if why else ("allow", "")
     if tool in WRITE_TOOLS:
         for p in _tool_paths(tool, inp):
@@ -122,7 +130,7 @@ def _decide_admin(cwd: Path, tool: str, inp: dict):
     return "allow", ""
 
 
-def _decide_user(rights: set, cwd: Path, tool: str, inp: dict):
+def _decide_user(rights: set, cwd: Path, tool: str, inp: dict, uploads: Path | None = None):
     if tool in META_TOOLS:
         return "allow", ""
     if tool.startswith("mcp__"):
@@ -134,15 +142,16 @@ def _decide_user(rights: set, cwd: Path, tool: str, inp: dict):
         if need not in rights:
             return "deny", "Нет права на " + ("чтение" if need == "read" else "изменение") + " файлов"
         paths = _tool_paths(tool, inp) or [str(cwd)]
+        roots = [cwd] + ([uploads] if uploads and need == "read" else [])
         for p in paths:
             rp = _resolve(p, cwd)
-            if not _within(rp, [cwd]):
+            if not _within(rp, roots):
                 return "deny", f"Доступ разрешён только внутри папки чата ({cwd})"
         return "allow", ""
     if tool in BASH_TOOLS:
         if "bash" not in rights:
             return "deny", "Нет права на выполнение команд"
-        cmd = str(inp.get("command", ""))
+        cmd = _strip_uploads(str(inp.get("command", "")), uploads)
         why = destructive_reason(cmd)
         if why:
             return "deny", f"Запрещено для пользователя: {why}"

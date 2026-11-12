@@ -146,10 +146,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             op = cmd.get("op")
             if op == "send":
                 text = str(cmd.get("text", ""))
-                persist("user", {"text": text})
-                log("user: " + text)
+                content = cmd.get("content") if isinstance(cmd.get("content"), list) else None
+                rec = {"text": str(cmd.get("display", text)) if content else text}
+                if cmd.get("files"):
+                    rec["files"] = cmd["files"]
+                persist("user", rec)
+                log("user: " + rec["text"] + (f" [+{len(rec.get('files', []))} файл(ов)]" if rec.get("files") else ""))
                 set_busy(True)
-                await write_stdin({"type": "user", "message": {"role": "user", "content": text}})
+                await write_stdin({"type": "user", "message": {"role": "user", "content": content or text}})
             elif op == "interrupt":
                 log("прерывание")
                 await write_stdin({"type": "control_request", "request_id": f"int-{time.time()}",

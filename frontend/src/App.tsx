@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, Chat, fmtTime, Incident, KIND_LABEL, User } from "./api";
+import { api, ApiError, Chat, fmtMb, fmtTime, Incident, KIND_LABEL, User } from "./api";
 import { socket } from "./ws";
 import Login from "./Login";
 import ChatView from "./ChatView";
@@ -137,21 +137,18 @@ export default function App() {
         <nav className="chat-list" aria-label="Диалоги">
           {chats.length === 0 && <div className="muted small pad">Диалогов пока нет</div>}
           {chats.map((c) => (
-            <button
+            <ChatItem
               key={c.id}
-              className={"chat-item" + (c.id === active && tab === "chat" ? " active" : "")}
-              onClick={() => {
+              chat={c}
+              active={c.id === active && tab === "chat"}
+              onOpen={() => {
                 setActive(c.id);
                 setTab("chat");
                 setDrawer(false);
               }}
-              title={c.title}
-            >
-              <StateDot chat={c} />
-              <span className="chat-title">{c.title}</span>
-              {c.approvals.length > 0 && <span className="badge warn" title="Ждёт подтверждения">!</span>}
-              {c.project && <span className="chip">{c.project}</span>}
-            </button>
+              runWithStart={runWithStart}
+              onToast={setToast}
+            />
           ))}
         </nav>
         <div className="sidebar-foot">
@@ -287,6 +284,58 @@ export default function App() {
           {toast}
         </div>
       )}
+    </div>
+  );
+}
+
+function ChatItem({ chat: c, active, onOpen, runWithStart, onToast }: {
+  chat: Chat; active: boolean; onOpen: () => void; runWithStart: RunWithStart; onToast: (s: string) => void;
+}) {
+  const suspended = c.state === "suspended";
+  async function act(e: React.MouseEvent, fn: () => Promise<any>) {
+    e.stopPropagation();
+    try {
+      await fn();
+    } catch (err: any) {
+      onToast(err.message);
+    }
+  }
+  return (
+    <div
+      className={"chat-item" + (active ? " active" : "")}
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && e.target === e.currentTarget && (e.preventDefault(), onOpen())}
+      title={c.title}
+    >
+      <div className="chat-item-main">
+        <div className="chat-item-top">
+          <StateDot chat={c} />
+          <span className="chat-title">{c.title}</span>
+          {c.approvals.length > 0 && <span className="badge warn" title="Ждёт подтверждения">!</span>}
+        </div>
+        <div className="chat-meta">
+          <span title="Папка">📁 {c.project || "личная"}</span>
+          <span title="Модель">{c.model || "модель по умолч."}</span>
+          <span>{suspended ? "на диске" : c.busy ? "отвечает…" : c.rss_mb > 0 ? fmtMb(c.rss_mb) : "в RAM"}</span>
+        </div>
+      </div>
+      <div className="chat-actions">
+        {suspended ? (
+          <button className="mini-btn" title="Вернуть в RAM" aria-label="Вернуть в RAM"
+            onClick={(e) => { e.stopPropagation(); runWithStart(() => api(`/chats/${c.id}/resume`, { method: "POST" })); }}>▶</button>
+        ) : (
+          <button className="mini-btn" title="Выгрузить на диск (контекст сохранится)" aria-label="Выгрузить на диск" disabled={c.busy}
+            onClick={(e) => act(e, () => api(`/chats/${c.id}/suspend`, { method: "POST" }))}>⏏</button>
+        )}
+        <button className="mini-btn danger" title="Удалить диалог" aria-label="Удалить диалог"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (confirm(`Удалить диалог «${c.title}» безвозвратно? Будут стёрты история, контекст Claude, вложения и файлы личной папки диалога.`))
+              act(e, () => api(`/chats/${c.id}`, { method: "DELETE" }));
+          }}>🗑</button>
+      </div>
     </div>
   );
 }

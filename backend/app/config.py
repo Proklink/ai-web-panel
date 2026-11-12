@@ -44,6 +44,9 @@ DEFAULT_SETTINGS = {
     "approval_timeout_s": 600,     # сколько ждать подтверждения опасного действия
 }
 
+UPLOAD_MAX_MB = int(os.environ.get("WEBPANEL_UPLOAD_MAX_MB", "25"))                # один файл
+UPLOAD_CHAT_QUOTA_MB = int(os.environ.get("WEBPANEL_UPLOAD_CHAT_QUOTA_MB", "500"))  # все вложения диалога
+
 RIGHTS = {
     "web": "Поиск и чтение веб-страниц (WebSearch, WebFetch)",
     "read": "Чтение файлов в папке чата/проекта (Read, Glob, Grep)",
