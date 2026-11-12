@@ -1,0 +1,24 @@
+[Unit]
+Description=Webpanel — веб-чаты с Claude Code
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/webpanel/webpanel.env
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=__ROOT__/backend
+ExecStart=__ROOT__/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-server-header --ws-max-size 1048576
+# Чаты живут в tmux-сервере, который запускает веб-сервер. KillMode=process — при рестарте
+# службы убивается только uvicorn, а tmux с открытыми диалогами продолжает работать.
+KillMode=process
+Restart=on-failure
+RestartSec=3
+UMask=0077
+# MemoryHigh тут не ставим: tmux и все процессы claude находятся в cgroup этой службы,
+# памятью управляет сам webpanel (резерв RAM, выгрузка, экстренное завершение).
+
+[Install]
+WantedBy=multi-user.target
