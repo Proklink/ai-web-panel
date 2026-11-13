@@ -42,6 +42,7 @@ DEFAULT_SETTINGS = {
     "session_estimate_mb": 400,    # минимальная оценка памяти на одну сессию claude
     "default_max_sessions": 2,     # лимит активных сессий для новых пользователей
     "approval_timeout_s": 600,     # сколько ждать подтверждения опасного действия
+    "admin_confirm": 1,            # 1 — опасные действия админа ждут подтверждения в UI, 0 — выполняются сразу
 }
 
 UPLOAD_MAX_MB = int(os.environ.get("WEBPANEL_UPLOAD_MAX_MB", "25"))                # один файл

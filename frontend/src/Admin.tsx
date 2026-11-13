@@ -15,6 +15,7 @@ const SETTING_LABELS: Record<string, [string, string]> = {
   session_estimate_mb: ["Оценка памяти на сессию, МБ", "Минимум; если реальные сессии крупнее, берётся среднее по ним"],
   default_max_sessions: ["Лимит сессий для новых пользователей", ""],
   approval_timeout_s: ["Ожидание подтверждения, с", "После — действие запрещается автоматически"],
+  admin_confirm: ["Подтверждения для админа (1 — да, 0 — нет)", "0 — опасные действия админа выполняются без запроса. Обычных пользователей не касается"],
 };
 
 export default function Admin({ me, rightsCatalog, onToast }: { me: User; rightsCatalog: Record<string, string>; onToast: (s: string) => void }) {

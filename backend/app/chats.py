@@ -808,6 +808,8 @@ class ChatManager:
             return {"decision": decision, "reason": reason}
 
         s = await db.get_settings()
+        if user["is_admin"] and not s["admin_confirm"]:
+            return {"decision": "allow", "reason": f"Подтверждения для админа отключены ({reason})"}
         a = Approval(secrets.token_hex(8), chat_id, tool, inp if isinstance(inp, dict) else {}, reason, time.time(),
                      asyncio.get_running_loop().create_future())
         rt.approvals[a.id] = a

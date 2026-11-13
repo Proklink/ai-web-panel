@@ -3,12 +3,14 @@
 Каждый вызов инструмента в чате проходит через PreToolUse-хук -> /internal/hook -> decide().
 Результат: ("allow" | "deny" | "ask", причина). "ask" означает: показать запрос в UI и ждать решения владельца чата.
 
-Админ: всё разрешено, но деструктивные действия с ОС и изменения вне workspace требуют подтверждения.
+Админ: всё разрешено. Подтверждение — только для действий с ОС (службы, процессы, диски, пакеты, sudo...) и
+деструктивных операций с файлами вне рабочих папок (workspace, /tmp, ~/.claude кроме projects/, папка чата). Внутри них — без вопросов.
 Обычные пользователи: только выданные админом права; файловые операции — только внутри папки чата;
 деструктивные/системные команды запрещены совсем.
 """
 import os
 import re
+import shlex
 from pathlib import Path
 
 from . import config
@@ -32,42 +34,110 @@ RIGHT_TOOLS = {
 
 SAFE_WRITE_ROOTS = [config.WORKSPACE, Path("/tmp")]
 
-# Деструктивные / системные команды. Для админа — подтверждение, для остальных — запрет.
-_DESTRUCTIVE = [
-    (r"\brm\s+(-[^\s]*\s+)*-[^\s]*[rRf]", "рекурсивное/принудительное удаление (rm -r/-f)"),
-    (r"\brm\s+[^|;&]*\s/(\s|$|[a-z])", "удаление в системных путях"),
-    (r"\b(mkfs|fdisk|parted|sfdisk|wipefs|mkswap|swapoff)\b", "операции с дисками"),
-    (r"\bdd\b[^|;&]*\bof=", "запись dd на устройство/файл"),
-    (r"\b(shutdown|reboot|poweroff|halt|init\s+[06])\b", "выключение/перезагрузка"),
+# Начало команды: строка, после ; & | ( ` $( или после sudo/xargs/env/... — чтобы слово «kill»
+# внутри строки Python или аргумента grep не считалось командой.
+_C = r"(?:^|[;&|(`\n{]\s*|\$\(\s*|\b(?:sudo|exec|xargs|nohup|time|env|then|do|else|nice|timeout\s+\S+)\s+(?:-\S+\s+)*)"
+
+# Действия с ОС: для админа — всегда подтверждение, для остальных — запрет.
+_SYSTEM = [
+    (_C + r"(mkfs\S*|fdisk|parted|sfdisk|wipefs|mkswap|swapoff)\b", "операции с дисками"),
+    (r"\bdd\b[^|;&]*\bof=/dev/", "запись dd на устройство"),
+    (_C + r"(shutdown|reboot|poweroff|halt|init\s+[06])\b", "выключение/перезагрузка"),
     (r"\bsystemctl\s+(stop|disable|mask|kill|restart|isolate|poweroff|reboot|halt)\b", "управление службами"),
     (r"\bservice\s+\S+\s+(stop|restart)\b", "управление службами"),
-    (r"\b(apt|apt-get|dpkg|snap|pip3?|npm)\s+[^|;&]*\b(remove|purge|uninstall|autoremove|-r\b|-P\b)", "удаление пакетов"),
-    (r"\b(chmod|chown|chgrp)\s+(-[^\s]*R|--recursive)", "рекурсивная смена прав"),
-    (r"\b(chmod|chown)\s+[^|;&]*\s/(etc|usr|bin|sbin|lib|boot|var|root)?(\s|/|$)", "смена прав в системных путях"),
-    (r"\b(kill|pkill|killall)\b", "завершение процессов"),
-    (r"\b(iptables|nft|ufw|ip6tables)\b", "изменение файрвола"),
-    (r"\b(useradd|userdel|usermod|passwd|chpasswd|groupdel|visudo)\b", "управление пользователями ОС"),
+    (r"\b(apt|apt-get|dpkg|snap)\s+[^|;&]*\b(remove|purge|autoremove|-r\b|-P\b)", "удаление пакетов"),
+    (r"\b(pip3?|npm)\s+(-\S+\s+)*(uninstall|remove|rm)\b[^|;&]*\s(-g\b|--global\b|--break-system-packages\b)", "удаление системных пакетов"),
+    (_C + r"(kill|pkill|killall)\b", "завершение процессов"),
+    (_C + r"(iptables|nft|ufw|ip6tables)\b", "изменение файрвола"),
+    (_C + r"(useradd|userdel|usermod|passwd|chpasswd|groupdel|visudo)\b", "управление пользователями ОС"),
     (r"\bdocker\s+(rm|rmi|kill|stop|system\s+prune|volume\s+rm|network\s+rm|compose\s+down)\b", "удаление/остановка docker"),
-    (r"\bgit\s+(push\s+[^|;&]*(--force|-f\b)|reset\s+--hard|clean\s+-[^\s]*f|branch\s+-D)", "необратимые git-операции"),
+    (r"\bgit\s+push\s+[^|;&]*(--force|-f\b)", "принудительный git push"),
     (r"\bcrontab\s+-r\b", "удаление crontab"),
     (r">\s*/dev/(sd|vd|nvme|hd)", "запись на блочное устройство"),
-    (r"(^|[\s;&|])>{1,2}\s*/(etc|usr|bin|sbin|lib|boot|var|root/\.ssh)/", "запись в системные файлы"),
-    (r"\b(tee|cp|mv|install|ln|sed\s+-i|truncate|shred)\b[^|;&]*\s/(etc|usr|bin|sbin|lib|lib64|boot|var|opt|root/\.ssh|root/\.claude)/", "изменение системных файлов"),
-    (r"\bshred\b|\bunlink\b", "необратимое удаление"),
     (r"\btmux\b[^|;&]*\bkill-(server|session)\b", "завершение tmux-сессий"),
     (r"\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z)?sh\b", "выполнение скрипта из интернета"),
     (r":\(\)\s*\{", "fork-бомба"),
-    (r"\bsudo\b|\bsu\s", "повышение привилегий"),
+    (_C + r"(sudo|su)(\s|$)", "повышение привилегий"),
     (r"\b(psql|dropdb|pg_ctl)\b[^|;&]*\b(drop|truncate|delete)\b", "удаление данных в БД"),
     (r"(/etc/webpanel|/var/lib/webpanel|\.claude/projects)", "доступ к данным webpanel/Claude"),
 ]
-_DESTRUCTIVE_RE = [(re.compile(p, re.IGNORECASE), why) for p, why in _DESTRUCTIVE]
+# Деструктивные операции с файлами: админу — подтверждение, только если команда затрагивает пути
+# вне рабочих папок (workspace, /tmp, папка чата); обычным пользователям — запрет.
+_FILE = [
+    (r"\brm\s+(-[^\s]*\s+)*-[^\s]*[rRf]", "рекурсивное/принудительное удаление (rm -r/-f)"),
+    (r"\brm\s+[^|;&]*\s/(\s|$|[a-z])", "удаление в системных путях"),
+    (r"\bdd\b[^|;&]*\bof=", "запись dd в файл"),
+    (r"\b(chmod|chown|chgrp)\s+(-[^\s]*R|--recursive)", "рекурсивная смена прав"),
+    (r"\b(chmod|chown)\s+[^|;&]*\s/(etc|usr|bin|sbin|lib|boot|var|root)?(\s|/|$)", "смена прав в системных путях"),
+    (r"\bgit\s+(reset\s+--hard|clean\s+-[^\s]*f|branch\s+-D)", "необратимые git-операции"),
+    (r"(^|[\s;&|])>{1,2}\s*/(etc|usr|bin|sbin|lib|boot|var|root/\.ssh)/", "запись в системные файлы"),
+    (r"\b(tee|cp|mv|install|ln|sed\s+-i|truncate|shred)\b[^|;&]*\s/(etc|usr|bin|sbin|lib|lib64|boot|var|opt|root/\.ssh|root/\.claude)/", "изменение системных файлов"),
+    (_C + r"(shred|unlink)\b", "необратимое удаление"),
+]
+_SYSTEM_RE = [(re.compile(p, re.IGNORECASE), why) for p, why in _SYSTEM]
+_FILE_RE = [(re.compile(p, re.IGNORECASE), why) for p, why in _FILE]
+# Для обычных пользователей — строже: слово-команда где угодно в строке, любое удаление пакетов.
+_DESTRUCTIVE_RE = [(re.compile(p.replace(_C, r"\b"), re.IGNORECASE), why) for p, why in _SYSTEM + _FILE] + [
+    (re.compile(r"\b(pip3?|npm)\s+[^|;&]*\b(remove|uninstall)\b", re.IGNORECASE), "удаление пакетов")]
 
 
 def destructive_reason(command: str) -> str | None:
+    """Для обычных пользователей: любое совпадение — запрет."""
     for rx, why in _DESTRUCTIVE_RE:
         if rx.search(command or ""):
             return why
+    return None
+
+
+def _first(rules, command: str) -> str | None:
+    for rx, why in rules:
+        if rx.search(command):
+            return why
+    return None
+
+
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1[^\n]*\n(.*?)(?:\n[ \t]*\2[ \t]*(?=\n|$)|$)", re.S)
+_SHELLS = re.compile(r"(^|[\s/|;&(])((ba|z|da|k)?sh|ssh|sudo|su|eval|source|xargs)(\s|$)")
+
+
+def _strip_heredocs(command: str) -> str:
+    """Убирает тело heredoc (это данные, а не команды), кроме случаев, когда его читает оболочка."""
+    def repl(m):
+        line_start = command.rfind("\n", 0, m.start()) + 1
+        if _SHELLS.search(command[line_start:m.start()]):
+            return m.group(0)
+        return "<<" + m.group(2) + "\n"
+    return _HEREDOC.sub(repl, command)
+
+
+_SAFE_DEV = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"}
+
+
+def _foreign_path(command: str, cwd: Path, roots) -> str | None:
+    """Первый путь в команде, который выходит за пределы roots (или неизвестен: $VAR, ~user)."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        toks = list(lex)
+    except ValueError:
+        toks = command.split()
+    for t in toks:
+        if "=" in t and not t.startswith(("/", "~", ".")):
+            t = t.split("=", 1)[1]
+        if not t or not ("/" in t or t.startswith(("~", "..", "$"))):
+            continue
+        if "://" in t:
+            continue  # URL
+        if t.startswith("$") or "/$" in t or "`" in t:
+            return t
+        if t.startswith("/dev/fd/") or t in _SAFE_DEV:
+            continue
+        p = Path(os.path.expanduser(t))
+        if not p.is_absolute():
+            p = cwd / p
+        rp = Path(os.path.realpath(p))
+        if not _within(rp, roots):
+            return str(rp)
     return None
 
 
@@ -113,18 +183,49 @@ def _strip_uploads(command: str, uploads: Path | None) -> str:
     return command.replace(str(uploads), "./uploads")
 
 
+def _admin_roots(cwd: Path, uploads: Path | None) -> list[Path]:
+    """Папки, где админ работает без подтверждений: workspace, /tmp, ~/.claude, рабочая папка и вложения чата."""
+    return SAFE_WRITE_ROOTS + [config.CLAUDE_HOME, cwd] + ([uploads] if uploads else [])
+
+
+def _protected(p: Path, cwd: Path, uploads: Path | None) -> bool:
+    """Служебные файлы webpanel и транскрипты диалогов (кроме своей рабочей папки и вложений).
+    Остальной ~/.claude (настройки, память, скиллы) админ меняет без подтверждения."""
+    if _within(p, [cwd] + ([uploads] if uploads else [])):
+        return False
+    return _within(p, [config.CLAUDE_HOME / "projects", Path("/etc/webpanel"), config.DATA_DIR])
+
+
+def _admin_bash(command: str, cwd: Path, uploads: Path | None):
+    cmd = _strip_uploads(command, uploads)
+    if _within(Path(os.path.realpath(cwd)), [config.DATA_DIR]):
+        cmd = cmd.replace(str(cwd), ".")  # личная папка диалога — не «данные webpanel»
+    cmd = _strip_heredocs(cmd)
+    why = _first(_SYSTEM_RE, cmd)
+    if why:
+        return "ask", f"Опасная команда: {why}"
+    why = _first(_FILE_RE, cmd)
+    if why:
+        roots = _admin_roots(cwd, uploads)
+        bad = _foreign_path(cmd, cwd, roots)
+        if bad is None and not _within(Path(os.path.realpath(cwd)), roots):
+            bad = str(cwd)
+        if bad is not None:
+            return "ask", f"Опасная команда вне рабочих папок: {why} ({bad})"
+    return "allow", ""
+
+
 def _decide_admin(cwd: Path, tool: str, inp: dict, uploads: Path | None = None):
     if tool == "AskUserQuestion":
         return "deny", "Интерактивные вопросы недоступны в веб-чате: задай вопрос обычным текстом"
     if tool in BASH_TOOLS:
-        why = destructive_reason(_strip_uploads(str(inp.get("command", "")), uploads))
-        return ("ask", f"Опасная команда: {why}") if why else ("allow", "")
+        return _admin_bash(str(inp.get("command", "")), cwd, uploads)
     if tool in WRITE_TOOLS:
         for p in _tool_paths(tool, inp):
             rp = _resolve(p, cwd)
-            if not _within(rp, SAFE_WRITE_ROOTS + [cwd]):
+            if not _within(rp, _admin_roots(cwd, uploads)):
                 return "ask", f"Изменение файла вне workspace: {rp}"
-            if _within(rp, [config.CLAUDE_HOME, Path("/etc/webpanel"), config.DATA_DIR]):
+            if _protected(rp, cwd, uploads):
                 return "ask", f"Изменение служебных файлов: {rp}"
         return "allow", ""
     return "allow", ""

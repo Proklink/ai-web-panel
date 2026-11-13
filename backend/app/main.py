@@ -148,6 +148,7 @@ class SettingsReq(BaseModel):
     session_estimate_mb: int | None = Field(default=None, ge=100, le=8192)
     default_max_sessions: int | None = Field(default=None, ge=0, le=20)
     approval_timeout_s: int | None = Field(default=None, ge=30, le=3600)
+    admin_confirm: int | None = Field(default=None, ge=0, le=1)
 
 
 MODELS = {"opus", "sonnet", "haiku", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"}
