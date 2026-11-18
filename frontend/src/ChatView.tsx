@@ -10,7 +10,7 @@ type Item =
   | { kind: "text"; key: string; text: string }
   | { kind: "thinking"; key: string; text: string }
   | { kind: "tool"; key: string; id: string; name: string; input: any; result?: { content: any; is_error: boolean } }
-  | { kind: "result"; key: string; d: any }
+  | { kind: "result"; key: string; d: any; limits?: any; ctx?: number }
   | { kind: "notice"; key: string; level: string; text: string; ts: number }
   | { kind: "approval"; key: string; a: any; outcome?: { decision: string; reason: string } };
 
@@ -18,6 +18,9 @@ function buildItems(events: Ev[]): Item[] {
   const items: Item[] = [];
   const tools = new Map<string, Item & { kind: "tool" }>();
   const approvals = new Map<string, Item & { kind: "approval" }>();
+  let limits: any = undefined; // последнее rate_limit_info.unifiedWindows (те же цифры, что в /usage)
+  let ctxTokens = 0, ctxModel = ""; // заполненность контекста по последнему ответу основного агента
+  const ctxWindow: Record<string, number> = {};
   for (const ev of events) {
     const d = ev.d || {};
     if (ev.k === "user") items.push({ kind: "user", key: "u" + ev.seq, text: d.text, ts: ev.ts, files: d.files });
@@ -38,6 +41,11 @@ function buildItems(events: Ev[]): Item[] {
       const t = d.type;
       if (t === "assistant") {
         if (d.parent_tool_use_id) continue; // события субагентов не показываем отдельно
+        const u = d.message?.usage;
+        if (u) {
+          ctxTokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+          ctxModel = d.message?.model || ctxModel;
+        }
         (d.message?.content || []).forEach((b: any, i: number) => {
           const key = `c${ev.seq}-${i}`;
           if (b.type === "text" && b.text?.trim()) items.push({ kind: "text", key, text: b.text });
@@ -56,11 +64,19 @@ function buildItems(events: Ev[]): Item[] {
               const it = tools.get(b.tool_use_id);
               if (it) it.result = { content: b.content, is_error: !!b.is_error };
             }
-      } else if (t === "result") items.push({ kind: "result", key: "r" + ev.seq, d });
-      else if (t === "system" && d.subtype === "api_retry")
+      } else if (t === "result") {
+        for (const [m, mu] of Object.entries<any>(d.modelUsage || {}))
+          if (mu?.contextWindow) ctxWindow[m] = mu.contextWindow;
+        const win = ctxWindow[ctxModel] || Math.max(0, ...Object.values(ctxWindow)) || 200000;
+        items.push({ kind: "result", key: "r" + ev.seq, d, limits, ctx: ctxTokens ? ctxTokens / win : undefined });
+      } else if (t === "system" && d.subtype === "api_retry")
         items.push({ kind: "notice", key: "s" + ev.seq, level: "warn", ts: ev.ts, text: `Повтор запроса к API (попытка ${d.attempt ?? "?"})…` });
-      else if (t === "rate_limit_event" && d.rate_limit_info?.status && d.rate_limit_info.status !== "allowed")
-        items.push({ kind: "notice", key: "l" + ev.seq, level: "warn", ts: ev.ts, text: `Лимит использования: ${d.rate_limit_info.status}` });
+      else if (t === "rate_limit_event") {
+        const info = d.rate_limit_info || {};
+        if (info.unifiedWindows) limits = info.unifiedWindows;
+        if (info.status && info.status !== "allowed")
+          items.push({ kind: "notice", key: "l" + ev.seq, level: "warn", ts: ev.ts, text: `Лимит использования: ${info.status}` });
+      }
     }
   }
   return items;
@@ -390,7 +406,13 @@ const ItemView = memo(function ItemView({ it, pending, chatId, onToast }: {
         <div className={"turn-end" + (err ? " err" : "")}>
           {err ? `Ход завершён с ошибкой: ${d.subtype}${d.result ? " — " + String(d.result).slice(0, 300) : ""}` : "Готово"}
           {typeof d.duration_ms === "number" && ` · ${(d.duration_ms / 1000).toFixed(1)} с`}
-          {typeof d.total_cost_usd === "number" && ` · $${d.total_cost_usd.toFixed(4)}`}
+          {typeof it.ctx === "number" && <span title="Заполненность контекста этого диалога"> · контекст {pct(it.ctx)}</span>}
+          {it.limits?.five_hour && (
+            <span title={"Текущая сессия (окно 5 ч), сброс " + resetAt(it.limits.five_hour.resetsAt)}> · сессия 5 ч {pct(it.limits.five_hour.utilization)}</span>
+          )}
+          {it.limits?.seven_day && (
+            <span title={"Недельный лимит, сброс " + resetAt(it.limits.seven_day.resetsAt)}> · неделя {pct(it.limits.seven_day.utilization)}</span>
+          )}
         </div>
       );
     }
@@ -423,6 +445,15 @@ const ItemView = memo(function ItemView({ it, pending, chatId, onToast }: {
     }
   }
 });
+
+function pct(x: number) {
+  return `${Math.round(x * 100)}%`;
+}
+
+function resetAt(sec?: number) {
+  if (!sec) return "?";
+  return new Date(sec * 1000).toLocaleString([], { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
 
 async function decide(chatId: string, id: string, allow: boolean, onToast: (s: string) => void) {
   try {
