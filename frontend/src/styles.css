@@ -252,6 +252,8 @@ label.check input { width: auto; }
 .meter-fill.ok { background: var(--ok); }
 .meter-fill.warn { background: var(--warn); }
 .meter-fill.crit { background: var(--err); }
+.limit-row { margin-top: 10px; }
+.limit-row .meter { margin: 4px 0 0; }
 .meter-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text); opacity: 0.6; }
 .cores { display: flex; gap: 4px; height: 28px; align-items: flex-end; margin-bottom: 8px; }
 .core { flex: 1; height: 100%; background: var(--panel-2); border-radius: 3px; display: flex; align-items: flex-end; overflow: hidden; }

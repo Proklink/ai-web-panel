@@ -619,6 +619,9 @@ class ChatManager:
             await db.execute(
             "UPDATE chats SET past_session_ids = array_append(past_session_ids, claude_session_id), claude_session_id = $2 "
             "WHERE id = $1 AND claude_session_id <> $2", uuid.UUID(rt.chat_id), uuid.UUID(d["session_id"]))
+        elif ev["k"] == "claude" and d.get("type") == "rate_limit_event":
+            from . import resources
+            resources.note_limits(d.get("rate_limit_info"), ev.get("ts") or time.time())
         elif ev["k"] == "sys" and d.get("event") == "started":
             rt.claude_pid = d.get("pid")
         elif ev["k"] == "sys" and d.get("event") == "exited":

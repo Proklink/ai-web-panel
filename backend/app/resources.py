@@ -1,4 +1,5 @@
 """Сбор метрик сервера и короткая история для графиков."""
+import json
 import os
 import time
 from collections import deque
@@ -11,6 +12,63 @@ MB = 1024 * 1024
 history: deque = deque(maxlen=600)  # 600 точек * 3 c = 30 минут
 _last_net = None
 psutil.cpu_percent(None)
+
+# Последние лимиты аккаунта Claude (rate_limit_info.unifiedWindows — те же цифры, что в /usage).
+# Аккаунт общий для всех чатов, поэтому храним одно значение и переживаем перезапуск через файл.
+_LIMITS_FILE = config.DATA_DIR / "limits.json"
+_limits: dict | None = None
+
+
+def note_limits(info: dict, ts: float):
+    global _limits
+    if not isinstance(info, dict) or not isinstance(info.get("unifiedWindows"), dict):
+        return
+    if _limits and _limits["ts"] > ts:
+        return
+    _limits = {"ts": ts, "status": info.get("status"), "windows": info["unifiedWindows"]}
+    try:
+        tmp = _LIMITS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_limits))
+        tmp.chmod(0o600)
+        tmp.replace(_LIMITS_FILE)
+    except OSError:
+        pass
+
+
+def get_limits() -> dict | None:
+    global _limits
+    if _limits is None:
+        try:
+            _limits = json.loads(_LIMITS_FILE.read_text())
+        except (OSError, ValueError):
+            _limits = _scan_limits()
+    return _limits
+
+
+def _scan_limits() -> dict | None:
+    """Первый запуск: ищем последнее rate_limit_event в недавно изменённых журналах чатов."""
+    try:
+        files = sorted(config.CHATS_DIR.glob("*/events.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    except OSError:
+        return None
+    best = None
+    for p in files:
+        try:
+            with open(p, "rb") as f:
+                f.seek(max(0, p.stat().st_size - 4 * MB))
+                for line in f:
+                    if b'"rate_limit_event"' not in line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    info = (ev.get("d") or {}).get("rate_limit_info") or {}
+                    if isinstance(info.get("unifiedWindows"), dict) and (not best or ev.get("ts", 0) > best["ts"]):
+                        best = {"ts": ev.get("ts", 0), "status": info.get("status"), "windows": info["unifiedWindows"]}
+        except OSError:
+            continue
+    return best
 
 
 def sample():
@@ -48,6 +106,7 @@ def snapshot(full: bool) -> dict:
                  "free_gb": round(du.free / 1024 ** 3, 1), "percent": du.percent},
         "net": {"rx_bps": history[-1]["rx"] if history else 0, "tx_bps": history[-1]["tx"] if history else 0},
         "history": list(history)[-200:],
+        "limits": get_limits(),
     }
     if full:
         procs = []

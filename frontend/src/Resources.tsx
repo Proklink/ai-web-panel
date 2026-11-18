@@ -20,7 +20,15 @@ interface Snap {
   sessions_total: number;
   top_processes?: { pid: number; name: string; user: string; rss_mb: number; cpu: number; cmd: string }[];
   data_dir_mb?: number | null;
+  limits?: { ts: number; status?: string; windows: Record<string, { utilization: number; resetsAt?: number; status?: string }> } | null;
 }
+
+const WINDOW_NAMES: Record<string, string> = {
+  five_hour: "Сессия (5 ч)",
+  seven_day: "Неделя",
+  seven_day_opus: "Неделя · Opus",
+  seven_day_sonnet: "Неделя · Sonnet",
+};
 
 export default function Resources({ user }: { user: User }) {
   const [s, setS] = useState<Snap | null>(null);
@@ -89,6 +97,8 @@ export default function Resources({ user }: { user: User }) {
         </div>
       </div>
 
+      <Limits l={s.limits} />
+
       <div className="card">
         <div className="row between">
           <strong>Память за последние минуты</strong>
@@ -143,6 +153,40 @@ export default function Resources({ user }: { user: User }) {
       )}
     </div>
   );
+}
+
+function Limits({ l }: { l?: Snap["limits"] }) {
+  const entries = Object.entries(l?.windows || {}).sort(
+    ([a], [b]) => (a in WINDOW_NAMES ? Object.keys(WINDOW_NAMES).indexOf(a) : 99) - (b in WINDOW_NAMES ? Object.keys(WINDOW_NAMES).indexOf(b) : 99),
+  );
+  return (
+    <div className="card">
+      <div className="row between">
+        <strong>Лимиты Claude</strong>
+        <span className="small muted">{l ? `как в /usage · данные на ${fmtTime(l.ts)}` : "как в /usage"}</span>
+      </div>
+      {entries.length === 0 && <div className="muted small">Пока нет данных — они появятся после первого ответа Claude в любом чате.</div>}
+      {entries.map(([k, w]) => {
+        const p = Math.round((w.utilization || 0) * 100);
+        const lvl = w.status === "rejected" || p >= 100 ? "crit" : p >= 80 ? "warn" : "ok";
+        return (
+          <div key={k} className="limit-row">
+            <div className="row between">
+              <span>{WINDOW_NAMES[k] || k}</span>
+              <span className="small"><strong>{p}%</strong>{w.resetsAt ? <span className="muted"> · сброс {fmtTime(w.resetsAt)}</span> : null}</span>
+            </div>
+            <div className="meter" aria-label={`${WINDOW_NAMES[k] || k}: ${p}%`}>
+              <div className={"meter-fill " + lvl} style={{ width: `${Math.min(p, 100)}%` }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function fmtTime(sec: number) {
+  return new Date(sec * 1000).toLocaleString([], { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 function Spark({ data, max, mark, unit }: { data: number[]; max: number; mark?: number; unit: string }) {
